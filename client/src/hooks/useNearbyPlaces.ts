@@ -35,22 +35,27 @@ const OVERPASS_MIRRORS = [
 
 // ── Query builders ────────────────────────────────────────────
 
-/** Unified fast query using explicit tags and nwr (node, way, relation) to prevent heavy regex load */
-function buildCombinedQuery(lat: number, lng: number, r: number): string {
-  const a = `(around:${r},${lat},${lng})`;
-  const o = (k: string, v: string) => `nwr["${k}"="${v}"]${a};\n`;
-  return `[out:json][timeout:30];
-(
-  ${['restaurant', 'fast_food', 'food_court', 'pub', 'bar', 'biergarten', 'cafe', 'theatre', 'cinema', 'arts_centre'].map(v => o('amenity', v)).join('')}
-  ${['castle', 'fort', 'manor', 'stately_home', 'country_house', 'estate', 'abbey', 'priory', 'cathedral', 'church', 'ruins', 'archaeological_site', 'battlefield', 'tower', 'building'].map(v => o('historic', v)).join('')}
-  ${['attraction', 'museum', 'gallery', 'viewpoint', 'theme_park', 'zoo', 'aquarium', 'artwork', 'picnic_site', 'camp_site'].map(v => o('tourism', v)).join('')}
-  ${['golf_course', 'sports_centre', 'swimming_pool', 'fitness_centre', 'marina', 'nature_reserve', 'park', 'garden', 'bird_hide', 'fishing', 'horse_riding', 'miniature_golf', 'water_park'].map(v => o('leisure', v)).join('')}
-  ${['peak', 'cliff', 'cave_entrance', 'beach', 'hot_spring', 'waterfall', 'bay', 'cape'].map(v => o('natural', v)).join('')}
-  ${o('waterway', 'waterfall')}
-  ${['distillery', 'winery', 'brewery', 'smokehouse'].map(v => o('craft', v)).join('')}
-  ${['outdoor', 'sports', 'gift', 'craft', 'farm', 'deli', 'seafood', 'distillery', 'winery', 'brewery'].map(v => o('shop', v)).join('')}
-);
-out center tags;`;
+function buildQueryForCategory(lat: number, lng: number, maxR: number, category: PlaceCategory | 'all'): string {
+  const o = (k: string, v: string) => `nwr["${k}"="${v}"](around:${maxR},${lat},${lng});\n`;
+  
+  const tagsEat = ['restaurant', 'fast_food', 'food_court'].map(v => o('amenity', v)).join('');
+  const tagsDrink = ['pub', 'bar', 'biergarten'].map(v => o('amenity', v)).join('');
+  const tagsCafe = o('amenity', 'cafe');
+  const tagsHistoric = ['castle', 'fort', 'manor', 'stately_home', 'country_house', 'estate', 'abbey', 'priory', 'cathedral', 'church', 'ruins', 'archaeological_site', 'battlefield', 'tower', 'building'].map(v => o('historic', v)).join('');
+  const tagsTourism = ['attraction', 'museum', 'gallery', 'viewpoint', 'theme_park', 'zoo', 'aquarium', 'artwork', 'picnic_site', 'camp_site'].map(v => o('tourism', v)).join('');
+  const tagsNature = ['peak', 'cliff', 'cave_entrance', 'beach', 'hot_spring', 'waterfall', 'bay', 'cape'].map(v => o('natural', v)).join('') + o('waterway', 'waterfall') + ['nature_reserve', 'park', 'garden', 'bird_hide'].map(v => o('leisure', v)).join('');
+  const tagsLeisure = ['golf_course', 'sports_centre', 'swimming_pool', 'fitness_centre', 'marina', 'fishing', 'horse_riding', 'miniature_golf', 'water_park'].map(v => o('leisure', v)).join('');
+  const tagsCraft = ['distillery', 'winery', 'brewery', 'smokehouse'].map(v => o('craft', v)).join('') + ['distillery', 'winery', 'brewery', 'farm', 'deli', 'seafood'].map(v => o('shop', v)).join('');
+  
+  let queries = '';
+  if (category === 'restaurant') queries = tagsEat;
+  else if (category === 'pub') queries = tagsDrink;
+  else if (category === 'cafe') queries = tagsCafe;
+  else if (category === 'attraction') queries = tagsHistoric + tagsTourism + tagsNature;
+  else if (category === 'activity') queries = tagsLeisure + tagsCraft;
+  else queries = tagsEat + tagsDrink + tagsCafe + tagsHistoric + tagsTourism + tagsNature + tagsLeisure + tagsCraft;
+
+  return `[out:json][timeout:30];\n(\n${queries});\nout center tags;`;
 }
 
 // ── Classification ────────────────────────────────────────────
@@ -218,17 +223,16 @@ function parseElements(
 
 // ── Main query function ───────────────────────────────────────
 
-async function queryOverpass(lat: number, lng: number, radiusMetres: number): Promise<NearbyPlace[]> {
+async function queryOverpass(lat: number, lng: number, radiusMetres: number, category: PlaceCategory | 'all'): Promise<NearbyPlace[]> {
   const r = Math.min(radiusMetres, 50000);
 
   // Run the combined fast query over our network of mirrors
-  const elements = await runQuery(buildCombinedQuery(lat, lng, r));
+  const elements = await runQuery(buildQueryForCategory(lat, lng, r, category));
 
   const seen = new Set<string>();
   const results: NearbyPlace[] = parseElements(elements, lat, lng, seen);
 
-  results.sort((a, b) => (a.distanceMiles ?? 999) - (b.distanceMiles ?? 999));
-  return results.slice(0, 150);
+  return results;
 }
 
 // ── React hook ────────────────────────────────────────────────
@@ -237,17 +241,22 @@ export function useNearbyPlaces() {
   const [places, setPlaces] = useState<NearbyPlace[]>([]);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [lastSearch, setLastSearch] = useState<{ lat: number; lng: number; radius: number } | null>(null);
+  const [lastSearch, setLastSearch] = useState<{ lat: number; lng: number; minMiles: number; maxMiles: number; category: PlaceCategory | 'all' } | null>(null);
 
-  const search = useCallback(async (lat: number, lng: number, radiusMiles: number = 20) => {
+  const search = useCallback(async (lat: number, lng: number, minMiles: number = 0, maxMiles: number = 20, category: PlaceCategory | 'all' = 'all') => {
     setLoading(true);
     setError(null);
-    const radiusMetres = Math.round(Math.min(radiusMiles, 31) * 1609.34);
+    const radiusMetres = Math.round(Math.min(maxMiles, 40) * 1609.34);
 
     try {
-      const results = await queryOverpass(lat, lng, radiusMetres);
-      setPlaces(results);
-      setLastSearch({ lat, lng, radius: radiusMiles });
+      const rawResults = await queryOverpass(lat, lng, radiusMetres, category);
+      
+      // Filter out anything falling in the inner hole of our distance ring
+      const ringFiltered = rawResults.filter(p => p.distanceMiles !== undefined && p.distanceMiles >= minMiles);
+      ringFiltered.sort((a, b) => (a.distanceMiles ?? 999) - (b.distanceMiles ?? 999));
+      
+      setPlaces(ringFiltered.slice(0, 200));
+      setLastSearch({ lat, lng, minMiles, maxMiles, category });
     } catch (err) {
       const msg = err instanceof Error ? err.message : 'Search failed';
       if (msg.includes('504') || msg.includes('timeout') || msg.includes('abort')) {

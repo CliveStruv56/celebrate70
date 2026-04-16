@@ -349,7 +349,7 @@ export default function ExplorePage() {
   const [locationName, setLocationName] = useState<string>('');
   const [gpsError, setGpsError] = useState<string | null>(null);
   const [gpsLoading, setGpsLoading] = useState(false);
-  const [radius, setRadius] = useState(20);
+  const [distanceBand, setDistanceBand] = useState<[number, number]>([0, 10]);
   const [activeFilter, setActiveFilter] = useState<PlaceCategory | 'all'>('all');
   const [viewMode, setViewMode] = useState<'list' | 'map'>('list');
   const [selectedId, setSelectedId] = useState<number | null>(null);
@@ -399,11 +399,11 @@ export default function ExplorePage() {
   }, [getLocation]);
 
   useEffect(() => {
-    if (userLat && userLng) search(userLat, userLng, radius);
-  }, [userLat, userLng, radius, search]);
+    if (userLat && userLng) search(userLat, userLng, distanceBand[0], distanceBand[1], activeFilter);
+  }, [userLat, userLng, distanceBand, search]); // Automatically search when location or distance changes
 
   function handleSearch() {
-    if (userLat && userLng) search(userLat, userLng, radius);
+    if (userLat && userLng) search(userLat, userLng, distanceBand[0], distanceBand[1], activeFilter);
   }
 
   function useTripLocation(day: typeof currentDay) {
@@ -414,7 +414,7 @@ export default function ExplorePage() {
     setLocationName(cleanLabel);
     // If coords are the same, useEffect won't trigger, so we force a search manually:
     if (userLat === day.lat && userLng === day.lng) {
-      search(day.lat, day.lng, radius);
+      search(day.lat, day.lng, distanceBand[0], distanceBand[1], activeFilter);
     }
   }
 
@@ -561,21 +561,21 @@ export default function ExplorePage() {
             </div>
           )}
 
-          {/* Radius + Search */}
+          {/* Distance Rings + Search */}
           <div className="mt-3 flex items-center gap-2 flex-wrap">
-            <span className="text-xs" style={{ color: 'oklch(0.55 0.04 155)' }}>Radius:</span>
-            {[5, 10, 20, 30].map(r => (
-              <button key={r} onClick={() => setRadius(r)}
+            <span className="text-xs font-semibold uppercase tracking-wider" style={{ color: 'oklch(0.55 0.04 155)' }}>Distance:</span>
+            {[[0, 10], [10, 20], [20, 30]].map((band) => (
+              <button key={`${band[0]}-${band[1]}`} onClick={() => setDistanceBand(band as [number, number])}
                 className="px-2.5 py-1 rounded-full text-xs font-semibold transition-all"
                 style={{
-                  background: radius === r ? 'oklch(0.28 0.07 155)' : 'oklch(0.94 0.03 80)',
-                  color: radius === r ? 'oklch(0.97 0.02 85)' : 'oklch(0.45 0.04 155)',
+                  background: distanceBand[0] === band[0] ? 'oklch(0.28 0.07 155)' : 'oklch(0.94 0.03 80)',
+                  color: distanceBand[0] === band[0] ? 'oklch(0.97 0.02 85)' : 'oklch(0.45 0.04 155)',
                 }}>
-                {r}mi
+                {band[0] > 0 ? `${band[0]}-${band[1]} mi` : `Within ${band[1]} mi`}
               </button>
             ))}
             <button onClick={handleSearch} disabled={loading || !userLat}
-              className="ml-auto flex items-center gap-1.5 px-3 py-1.5 rounded-full text-xs font-semibold transition-all"
+              className="ml-auto flex items-center gap-1.5 px-3 py-1.5 rounded-full text-xs font-semibold transition-all hover:opacity-80"
               style={{ background: 'oklch(0.72 0.14 68)', color: 'oklch(0.15 0.04 155)' }}>
               {loading ? <Loader2 size={12} className="animate-spin" /> : <Search size={12} />}
               Search
@@ -611,8 +611,12 @@ export default function ExplorePage() {
         {/* Category filters */}
         <div className="flex gap-2 overflow-x-auto pb-1 no-scrollbar">
           {CATEGORY_FILTERS.map(({ key, label, icon: Icon }) => (
-            <button key={key} onClick={() => setActiveFilter(key)}
-              className="flex-shrink-0 flex items-center gap-1.5 px-3 py-1.5 rounded-full text-xs font-semibold transition-all"
+            <button key={key} 
+              onClick={() => {
+                setActiveFilter(key);
+                if (userLat && userLng) search(userLat, userLng, distanceBand[0], distanceBand[1], key);
+              }}
+              className="flex-shrink-0 flex items-center gap-1.5 px-3 py-1.5 rounded-full text-xs font-semibold transition-all hover:opacity-80"
               style={{
                 background: activeFilter === key ? 'oklch(0.72 0.14 68)' : 'oklch(0.94 0.03 80)',
                 color: activeFilter === key ? 'oklch(0.15 0.04 155)' : 'oklch(0.45 0.04 155)',
@@ -661,8 +665,8 @@ export default function ExplorePage() {
         {/* Results: Map view */}
         {!loading && !error && filtered.length > 0 && viewMode === 'map' && (
           <div className="space-y-3">
-            <p className="text-xs" style={{ color: 'oklch(0.55 0.04 155)' }}>
-              {filtered.length} place{filtered.length !== 1 ? 's' : ''} found within {radius} miles
+            <p className="text-xs font-semibold" style={{ color: 'oklch(0.55 0.04 155)' }}>
+              {filtered.length} place{filtered.length !== 1 ? 's' : ''} found {distanceBand[0] > 0 ? `between ${distanceBand[0]} and ${distanceBand[1]} miles` : `within ${distanceBand[1]} miles`}
               {selectedId !== null && (
                 <button onClick={() => setSelectedId(null)}
                   className="ml-2 underline" style={{ color: 'oklch(0.45 0.08 68)' }}>
@@ -699,13 +703,15 @@ export default function ExplorePage() {
 
         {/* Results: List view */}
         {!loading && !error && filtered.length > 0 && viewMode === 'list' && (
-          <div className="space-y-2" ref={listRef}>
-            <p className="text-xs" style={{ color: 'oklch(0.55 0.04 155)' }}>
-              {filtered.length} place{filtered.length !== 1 ? 's' : ''} found within {radius} miles
-              <span className="ml-2" style={{ color: 'oklch(0.65 0.08 68)' }}>
-                · Tap a card to see it on the map
-              </span>
-            </p>
+          <div ref={listRef} className="space-y-4">
+            <div className="flex items-center justify-between">
+              <p className="text-xs font-semibold" style={{ color: 'oklch(0.55 0.04 155)' }}>
+                {filtered.length} place{filtered.length !== 1 ? 's' : ''} found {distanceBand[0] > 0 ? `between ${distanceBand[0]} and ${distanceBand[1]} miles` : `within ${distanceBand[1]} miles`}
+                <span className="ml-2" style={{ color: 'oklch(0.65 0.08 68)' }}>
+                  · Tap a card to see it on the map
+                </span>
+              </p>
+            </div>
             {filtered.map(place => (
               <div key={place.id} id={`place-card-${place.id}`}>
                 <PlaceCard
