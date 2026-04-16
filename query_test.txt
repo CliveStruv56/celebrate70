@@ -1,0 +1,8 @@
+[out:json][timeout:30];
+(
+  nwr["amenity"="pub"](around:32186,57.5252,-3.9301);
+  nwr["historic"="castle"](around:32186,57.5252,-3.9301);
+  nwr["historic"="stately_home"](around:32186,57.5252,-3.9301);
+  nwr["historic"="country_house"](around:32186,57.5252,-3.9301);
+);
+out center tags 10;
