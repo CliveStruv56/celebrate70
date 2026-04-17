@@ -4,6 +4,7 @@
 // =============================================================
 import { useSyncExternalStore } from 'react';
 import { supabase } from './supabase';
+import { canWrite, getPassphrase } from './access';
 
 export type EventType = 'ferry' | 'checkin' | 'checkout' | 'drive' | 'stay' | 'travel';
 
@@ -475,13 +476,29 @@ export function getNextEvent(dayIndex: number): TripEvent | null {
 
 const TRIP_ID = 'cawdor-70';
 
+function isValidTripDay(d: unknown): d is TripDay {
+  if (!d || typeof d !== 'object') return false;
+  const day = d as Record<string, unknown>;
+  return typeof day.id === 'string'
+    && typeof day.date === 'string'
+    && typeof day.lat === 'number'
+    && typeof day.lng === 'number'
+    && Array.isArray(day.events);
+}
+
+function isValidTripDays(v: unknown): v is TripDay[] {
+  return Array.isArray(v) && v.every(isValidTripDay);
+}
+
 // 1. Initial Load: Try Local Storage first for instant display
 try {
   const stored = localStorage.getItem('celebrate70_itinerary');
   if (stored) {
     const parsed = JSON.parse(stored);
-    TRIP_DAYS.length = 0;
-    TRIP_DAYS.push(...parsed);
+    if (isValidTripDays(parsed) && parsed.length > 0) {
+      TRIP_DAYS.length = 0;
+      TRIP_DAYS.push(...parsed);
+    }
   }
 } catch (e) {
   console.error("Failed to load local itinerary", e);
@@ -501,11 +518,14 @@ if (supabase) {
   // Fetch authoritative state from cloud on boot
   supabase.from('shared_trips').select('itinerary_state').eq('trip_id', TRIP_ID).single()
     .then(({ data }) => {
-      if (data?.itinerary_state && Array.isArray(data.itinerary_state) && data.itinerary_state.length > 0) {
+      const incoming = data?.itinerary_state;
+      if (isValidTripDays(incoming) && incoming.length > 0) {
         TRIP_DAYS.length = 0;
-        TRIP_DAYS.push(...data.itinerary_state);
+        TRIP_DAYS.push(...incoming);
         localStorage.setItem('celebrate70_itinerary', JSON.stringify(TRIP_DAYS));
         listeners.forEach(l => l());
+      } else if (incoming !== undefined && incoming !== null) {
+        console.warn('Rejected malformed itinerary_state from Supabase');
       }
     });
 
@@ -514,12 +534,14 @@ if (supabase) {
     .on('postgres_changes', { event: 'UPDATE', schema: 'public', table: 'shared_trips', filter: `trip_id=eq.${TRIP_ID}` },
       (payload) => {
         const newState = payload.new.itinerary_state;
-        if (newState && Array.isArray(newState) && newState.length > 0) {
+        if (isValidTripDays(newState) && newState.length > 0) {
           TRIP_DAYS.length = 0;
           TRIP_DAYS.push(...newState);
           tripDaysSnapshot = [...TRIP_DAYS];
           localStorage.setItem('celebrate70_itinerary', JSON.stringify(TRIP_DAYS));
           listeners.forEach(l => l());
+        } else if (newState !== undefined && newState !== null) {
+          console.warn('Rejected malformed itinerary_state from Supabase realtime');
         }
       })
     .subscribe();
@@ -554,8 +576,16 @@ function syncItineraryToCloud() {
   tripDaysSnapshot = [...TRIP_DAYS];
   localStorage.setItem('celebrate70_itinerary', JSON.stringify(TRIP_DAYS));
   listeners.forEach(l => l());
-  if (supabase) {
-    supabase.from('shared_trips').update({ itinerary_state: TRIP_DAYS }).eq('trip_id', TRIP_ID).then();
+  // Local edits always persist; cloud sync is gated so a casual visitor
+  // holding the share link can't overwrite everyone else's view.
+  if (supabase && canWrite()) {
+    supabase.rpc('update_shared_trip', {
+      p_trip_id: TRIP_ID,
+      p_passphrase: getPassphrase(),
+      p_itinerary_state: TRIP_DAYS,
+    }).then(({ error }) => {
+      if (error) console.error('Itinerary cloud sync failed:', error.message);
+    });
   }
 }
 

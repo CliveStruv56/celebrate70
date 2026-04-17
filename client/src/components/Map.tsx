@@ -177,7 +177,7 @@ export function MapView({
         zoomControl: true,
         streetViewControl: true,
         clickableIcons: false, // Prevents native Google POIs from hijacking clicks
-        mapId: "DEMO_MAP_ID",
+        mapId: "dc3840c855095425d4e133f1",
       });
       if (onMapReady) {
         onMapReady(map.current);

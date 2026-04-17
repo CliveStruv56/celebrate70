@@ -1,22 +1,28 @@
-// CELEBRATE 70 — Explore Page (v3)
+// CELEBRATE 70 — Explore Page (v4)
 // Design: Scottish Romanticism — forest green / amber gold / warm parchment
-// Features:
-//   - List view + Map view toggle
-//   - Google Maps with AdvancedMarkerElement pins colour-coded by category
-//   - Info windows on pin tap showing name, category, distance, directions link
-//   - "You are here" origin pin
-//   - Category filter chips sync with both views
-//   - Trip location shortcuts
+// Changes since v3:
+//   - Map mounts once per origin; markers are diffed imperatively in a
+//     dedicated effect (was: full <MapView key=…${places.length}> remount).
+//   - InfoWindow content is built from DOM nodes + textContent, not a
+//     template string (OSM `name` tags are user-editable worldwide).
+//   - Category chips are a pure client-side filter — no refetch.
+//   - Geolocation uses enableHighAccuracy:false + maximumAge:60000
+//     (100m accuracy is fine for a "what's within 10 miles" app).
+//   - Google Place details persist to localStorage (7d TTL) so revisiting
+//     a known place is instant and doesn't burn billable calls.
+//   - External-link button is now a MapsPicker (Apple / Google / Waze).
 
-import { useState, useEffect, useCallback, useRef } from "react";
+import { useState, useEffect, useCallback, useRef, useMemo } from "react";
 import {
   MapPin, Navigation, Search, Loader2, AlertCircle,
-  ExternalLink, Utensils, Beer, Landmark, Activity,
+  Utensils, Beer, Landmark, Activity,
   Coffee, RefreshCw, List, Map as MapIcon,
 } from "lucide-react";
 import { MapView, loadMapScript } from "@/components/Map";
+import { MapsPicker } from "@/components/MapsPicker";
 import { useNearbyPlaces, type PlaceCategory, type NearbyPlace } from "@/hooks/useNearbyPlaces";
 import { TRIP_DAYS, getCurrentDayIndex } from "@/lib/itinerary";
+import { safeUrl } from "@/lib/safeUrl";
 
 export interface GooglePlaceDetails {
   rating?: number;
@@ -29,6 +35,38 @@ export interface GooglePlaceDetails {
   error?: string;
 }
 
+// ── Google Place details cache (localStorage, 7 day TTL) ──────────────────────
+
+const DETAILS_CACHE_PREFIX = "celebrate70_place_details_v1:";
+const DETAILS_TTL_MS = 7 * 24 * 60 * 60 * 1000;
+
+interface DetailsCacheEntry { ts: number; details: GooglePlaceDetails }
+
+function readDetailsCache(osmId: number): GooglePlaceDetails | null {
+  try {
+    const raw = localStorage.getItem(DETAILS_CACHE_PREFIX + osmId);
+    if (!raw) return null;
+    const parsed = JSON.parse(raw) as DetailsCacheEntry;
+    if (Date.now() - parsed.ts > DETAILS_TTL_MS) return null;
+    // Don't cache negative (error) results — we want to retry those.
+    if (parsed.details.error) return null;
+    return parsed.details;
+  } catch {
+    return null;
+  }
+}
+
+function writeDetailsCache(osmId: number, details: GooglePlaceDetails) {
+  try {
+    if (details.error) return;
+    localStorage.setItem(
+      DETAILS_CACHE_PREFIX + osmId,
+      JSON.stringify({ ts: Date.now(), details } satisfies DetailsCacheEntry),
+    );
+  } catch {
+    /* quota exceeded; ignore */
+  }
+}
 
 // ── Category config ────────────────────────────────────────────────────────────
 
@@ -52,6 +90,11 @@ const CATEGORY_COLORS: Record<PlaceCategory | 'all', { bg: string; text: string;
   accommodation: { bg: 'oklch(0.50 0.08 290 / 0.12)', text: 'oklch(0.40 0.06 290)', pin: '#7f8c8d' },
 };
 
+const CATEGORY_EMOJI: Record<PlaceCategory, string> = {
+  restaurant: '🍽', pub: '🍺', attraction: '🏛',
+  activity: '⛳', cafe: '☕', accommodation: '🏠',
+};
+
 // ── PlaceCard ──────────────────────────────────────────────────────────────────
 
 function PlaceCard({ place, highlight, onClick, googleDetails, isLoadingDetails }: {
@@ -61,20 +104,17 @@ function PlaceCard({ place, highlight, onClick, googleDetails, isLoadingDetails 
   googleDetails?: GooglePlaceDetails;
   isLoadingDetails?: boolean;
 }) {
-  const mapsUrl = `https://maps.google.com/?q=${place.lat},${place.lng}`;
   const iconMap: Record<PlaceCategory, React.ElementType> = {
     restaurant: Utensils, pub: Beer, attraction: Landmark,
     activity: Activity, cafe: Coffee, accommodation: MapPin,
   };
   const Icon = iconMap[place.category] || MapPin;
   const colors = CATEGORY_COLORS[place.category] || CATEGORY_COLORS.all;
-
-  // If no onClick is provided (we are in Map mode or highlight mode), clicking the card opens Maps natively
-  const handleCardInteraction = onClick || (() => window.open(mapsUrl, '_blank'));
+  const safeWebsite = safeUrl(googleDetails?.website);
 
   return (
     <div
-      onClick={handleCardInteraction}
+      onClick={onClick}
       className="rounded-xl flex flex-col overflow-hidden transition-all cursor-pointer border hover:border-gray-400"
       style={{
         background: highlight ? 'oklch(0.97 0.04 80)' : 'oklch(1 0 0)',
@@ -117,17 +157,17 @@ function PlaceCard({ place, highlight, onClick, googleDetails, isLoadingDetails 
               )}
               {highlight && googleDetails?.openNow !== undefined && (
                 <span className="text-[10px] font-semibold px-1.5 py-0.5 rounded"
-                  style={{ 
-                    background: googleDetails.openNow ? 'oklch(0.95 0.1 150)' : 'oklch(0.95 0.1 25)', 
+                  style={{
+                    background: googleDetails.openNow ? 'oklch(0.95 0.1 150)' : 'oklch(0.95 0.1 25)',
                     color: googleDetails.openNow ? 'oklch(0.3 0.1 150)' : 'oklch(0.3 0.1 25)'
                   }}>
                   {googleDetails.openNow ? 'Open Now' : 'Closed'}
                 </span>
               )}
-              {highlight && (googleDetails as any)?.error && (
+              {highlight && googleDetails?.error && (
                 <span className="text-[10px] font-semibold px-1.5 py-0.5 rounded"
                   style={{ background: 'oklch(0.95 0.1 25)', color: 'oklch(0.3 0.1 25)' }}>
-                  Google API Error: {(googleDetails as any).error}
+                  Google API Error: {googleDetails.error}
                 </span>
               )}
               {highlight && isLoadingDetails && (
@@ -141,15 +181,17 @@ function PlaceCard({ place, highlight, onClick, googleDetails, isLoadingDetails 
                 {place.address}
               </div>
             )}
-            
+
             {/* Extended Details */}
             {highlight && googleDetails && (
               <div className="mt-3 space-y-1.5" style={{ color: 'oklch(0.35 0.04 155)' }}>
                 {googleDetails.phone && (
                   <div className="text-[11px]">📞 {googleDetails.phone}</div>
                 )}
-                {googleDetails.website && (
-                  <div className="text-[11px] truncate">🔗 <a href={googleDetails.website} target="_blank" rel="noreferrer" onClick={e => e.stopPropagation()} className="underline hover:text-blue-600">{googleDetails.website}</a></div>
+                {safeWebsite && (
+                  <div className="text-[11px] truncate">
+                    🔗 <a href={safeWebsite} target="_blank" rel="noopener noreferrer" onClick={e => e.stopPropagation()} className="underline hover:text-blue-600">{safeWebsite}</a>
+                  </div>
                 )}
                 {googleDetails.weekdayText && googleDetails.weekdayText.length > 0 && (
                   <div className="text-[11px] mt-2 bg-white/50 p-2 rounded leading-snug border border-gray-200">
@@ -168,13 +210,7 @@ function PlaceCard({ place, highlight, onClick, googleDetails, isLoadingDetails 
               </div>
             )}
           </div>
-          <a href={mapsUrl} target="_blank" rel="noopener noreferrer"
-            onClick={e => e.stopPropagation()}
-            title="Open in Native Google Maps"
-            className="flex-shrink-0 p-2 rounded-lg mt-0.5 hover:bg-gray-200"
-            style={{ background: 'oklch(0.28 0.07 155 / 0.08)' }}>
-            <ExternalLink size={15} style={{ color: 'oklch(0.28 0.07 155)' }} />
-          </a>
+          <MapsPicker lat={place.lat} lng={place.lng} label={place.name} compact />
         </div>
       </div>
     </div>
@@ -191,112 +227,155 @@ interface MapPanelProps {
   onSelectPlace: (id: number | null) => void;
 }
 
+function makePinElement(color: string, emoji: string): HTMLElement {
+  const wrap = document.createElement('div');
+  wrap.style.cssText = 'display:flex;flex-direction:column;align-items:center;cursor:pointer;';
+
+  const tear = document.createElement('div');
+  tear.style.cssText = [
+    'width:32px', 'height:32px', 'border-radius:50% 50% 50% 0',
+    'transform:rotate(-45deg)', `background:${color}`,
+    'border:2px solid rgba(255,255,255,0.9)',
+    'box-shadow:0 2px 6px rgba(0,0,0,0.35)',
+    'display:flex', 'align-items:center', 'justify-content:center',
+  ].join(';');
+
+  const glyph = document.createElement('span');
+  glyph.style.cssText = 'transform:rotate(45deg);font-size:13px;line-height:1;';
+  glyph.textContent = emoji; // safe: our own constants
+  tear.appendChild(glyph);
+  wrap.appendChild(tear);
+  return wrap;
+}
+
+// Build InfoWindow content as DOM nodes (never interpolate untrusted text
+// into an HTML string — OSM `name` tags are user-editable globally).
+function makeInfoWindowContent(place: NearbyPlace): HTMLElement {
+  const root = document.createElement('div');
+  root.style.cssText = "font-family:'Playfair Display',serif;max-width:220px;padding:4px 2px;";
+
+  const title = document.createElement('div');
+  title.style.cssText = 'font-weight:700;font-size:13px;color:#1a2e1e;margin-bottom:4px;';
+  title.textContent = place.name;
+  root.appendChild(title);
+
+  const meta = document.createElement('div');
+  meta.style.cssText = 'font-size:11px;color:#4a7c59;margin-bottom:2px;';
+  const metaText = place.distanceMiles !== undefined
+    ? `${place.categoryLabel} · ${place.distanceMiles} mi`
+    : place.categoryLabel;
+  meta.textContent = metaText;
+  root.appendChild(meta);
+
+  if (place.address) {
+    const addr = document.createElement('div');
+    addr.style.cssText = 'font-size:10px;color:#6b7280;margin-bottom:6px;';
+    addr.textContent = place.address;
+    root.appendChild(addr);
+  }
+
+  const link = document.createElement('a');
+  link.href = `https://maps.google.com/?q=${place.lat},${place.lng}`;
+  link.target = '_blank';
+  link.rel = 'noopener noreferrer';
+  link.style.cssText = [
+    'display:inline-flex', 'align-items:center', 'gap:4px',
+    'font-size:11px', 'font-weight:600', 'color:#1a73e8',
+    'text-decoration:none', 'margin-top:2px',
+  ].join(';');
+  link.textContent = 'Open in Maps ↗';
+  root.appendChild(link);
+
+  return root;
+}
+
 function MapPanel({ places, originLat, originLng, selectedId, onSelectPlace }: MapPanelProps) {
   const mapRef = useRef<google.maps.Map | null>(null);
-  const markersRef = useRef<google.maps.marker.AdvancedMarkerElement[]>([]);
+  const markersRef = useRef<Map<number, google.maps.marker.AdvancedMarkerElement>>(new Map());
   const infoWindowRef = useRef<google.maps.InfoWindow | null>(null);
   const originMarkerRef = useRef<google.maps.marker.AdvancedMarkerElement | null>(null);
+  const [mapReady, setMapReady] = useState(false);
 
-  // Build a custom SVG pin element for AdvancedMarkerElement
-  function makePinElement(color: string, emoji: string): HTMLElement {
-    const div = document.createElement('div');
-    div.style.cssText = `
-      display:flex; flex-direction:column; align-items:center; cursor:pointer;
-    `;
-    div.innerHTML = `
-      <div style="
-        width:32px; height:32px; border-radius:50% 50% 50% 0;
-        transform:rotate(-45deg); background:${color};
-        border:2px solid rgba(255,255,255,0.9);
-        box-shadow:0 2px 6px rgba(0,0,0,0.35);
-        display:flex; align-items:center; justify-content:center;
-      ">
-        <span style="transform:rotate(45deg); font-size:13px; line-height:1;">${emoji}</span>
-      </div>
-    `;
-    return div;
-  }
-
-  function categoryEmoji(cat: PlaceCategory): string {
-    const map: Record<PlaceCategory, string> = {
-      restaurant: '🍽', pub: '🍺', attraction: '🏛',
-      activity: '⛳', cafe: '☕', accommodation: '🏠',
-    };
-    return map[cat] || '📍';
-  }
-
+  // Map is created exactly once per (origin) lifetime — no places dep here.
   const handleMapReady = useCallback((map: google.maps.Map) => {
     mapRef.current = map;
     infoWindowRef.current = new google.maps.InfoWindow();
+    setMapReady(true);
+  }, []);
 
-    // "You are here" origin marker
-    if (originLat && originLng) {
-      const originEl = document.createElement('div');
-      originEl.style.cssText = `
-        width:18px; height:18px; border-radius:50%;
-        background:#1a73e8; border:3px solid white;
-        box-shadow:0 0 0 3px rgba(26,115,232,0.3);
-      `;
-      originMarkerRef.current = new google.maps.marker.AdvancedMarkerElement({
-        map,
-        position: { lat: originLat, lng: originLng },
-        title: 'Search origin',
-        content: originEl,
-      });
-    }
+  // Origin marker (updates if origin changes without remounting the map).
+  useEffect(() => {
+    if (!mapReady || !mapRef.current) return;
+    if (originMarkerRef.current) originMarkerRef.current.map = null;
+    originMarkerRef.current = null;
+    if (originLat == null || originLng == null) return;
 
-    // Place markers
-    places.forEach(place => {
+    const el = document.createElement('div');
+    el.style.cssText = [
+      'width:18px', 'height:18px', 'border-radius:50%',
+      'background:#1a73e8', 'border:3px solid white',
+      'box-shadow:0 0 0 3px rgba(26,115,232,0.3)',
+    ].join(';');
+    originMarkerRef.current = new google.maps.marker.AdvancedMarkerElement({
+      map: mapRef.current,
+      position: { lat: originLat, lng: originLng },
+      title: 'Search origin',
+      content: el,
+    });
+  }, [mapReady, originLat, originLng]);
+
+  // Diff markers against the places prop. Re-use existing markers where
+  // possible so the map doesn't flash on every filter/search.
+  useEffect(() => {
+    if (!mapReady || !mapRef.current) return;
+    const map = mapRef.current;
+    const current = markersRef.current;
+    const nextIds = new Set(places.map(p => p.id));
+
+    // Remove markers no longer in the set.
+    const toRemove: number[] = [];
+    current.forEach((marker, id) => {
+      if (!nextIds.has(id)) {
+        marker.map = null;
+        toRemove.push(id);
+      }
+    });
+    toRemove.forEach(id => current.delete(id));
+
+    // Add new markers.
+    for (const place of places) {
+      if (current.has(place.id)) continue;
       const colors = CATEGORY_COLORS[place.category] || CATEGORY_COLORS.all;
-      const pinEl = makePinElement(colors.pin, categoryEmoji(place.category));
-
+      const emoji = CATEGORY_EMOJI[place.category] || '📍';
       const marker = new google.maps.marker.AdvancedMarkerElement({
         map,
         position: { lat: place.lat, lng: place.lng },
         title: place.name,
-        content: pinEl,
+        content: makePinElement(colors.pin, emoji),
       });
-
       marker.addListener('click', () => {
         onSelectPlace(place.id);
-        const mapsUrl = `https://maps.google.com/?q=${place.lat},${place.lng}`;
-        infoWindowRef.current?.setContent(`
-          <div style="font-family:'Playfair Display',serif; max-width:200px; padding:4px 2px;">
-            <div style="font-weight:700; font-size:13px; color:#1a2e1e; margin-bottom:4px;">${place.name}</div>
-            <div style="font-size:11px; color:#4a7c59; margin-bottom:2px;">${place.categoryLabel}${place.distanceMiles !== undefined ? ' · ' + place.distanceMiles + ' mi' : ''}</div>
-            ${place.address ? `<div style="font-size:10px; color:#6b7280; margin-bottom:6px;">${place.address}</div>` : ''}
-            <a href="${mapsUrl}" target="_blank" style="
-              display:inline-flex; align-items:center; gap:4px;
-              font-size:11px; font-weight:600; color:#1a73e8;
-              text-decoration:none; margin-top:2px;
-            ">Open in Maps ↗</a>
-          </div>
-        `);
+        infoWindowRef.current?.setContent(makeInfoWindowContent(place));
         infoWindowRef.current?.open({ map, anchor: marker });
       });
+      current.set(place.id, marker);
+    }
 
-      markersRef.current.push(marker);
-    });
-
-    // Fit bounds or pan to selected
-    if (selectedId !== null) {
-      const selectedPlace = places.find(p => p.id === selectedId);
-      if (selectedPlace) {
-        map.setCenter({ lat: selectedPlace.lat, lng: selectedPlace.lng });
-        map.setZoom(15);
-      }
-    } else if (places.length > 0) {
+    // Framing: only auto-fit when nothing is selected, and only when the
+    // set of places actually changed (avoids zoom jitter on re-renders).
+    if (selectedId === null && places.length > 0) {
       const bounds = new google.maps.LatLngBounds();
-      if (originLat && originLng) bounds.extend({ lat: originLat, lng: originLng });
+      if (originLat != null && originLng != null) bounds.extend({ lat: originLat, lng: originLng });
       places.slice(0, 50).forEach(p => bounds.extend({ lat: p.lat, lng: p.lng }));
       map.fitBounds(bounds, { top: 60, right: 20, bottom: 20, left: 20 });
-    } else if (originLat && originLng) {
+    } else if (places.length === 0 && originLat != null && originLng != null) {
       map.setCenter({ lat: originLat, lng: originLng });
       map.setZoom(11);
     }
-  }, [places, originLat, originLng, onSelectPlace, selectedId]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps — framing intentionally only reacts to the place set
+  }, [places, mapReady, onSelectPlace]);
 
-  // Pan to selected marker when selectedId changes
+  // Pan to selected marker when selectedId changes.
   useEffect(() => {
     if (!mapRef.current || selectedId === null) return;
     const place = places.find(p => p.id === selectedId);
@@ -306,14 +385,24 @@ function MapPanel({ places, originLat, originLng, selectedId, onSelectPlace }: M
     }
   }, [selectedId, places]);
 
-  const center = originLat && originLng
+  // Clean up on unmount.
+  useEffect(() => {
+    return () => {
+      markersRef.current.forEach(marker => { marker.map = null; });
+      markersRef.current.clear();
+      if (originMarkerRef.current) originMarkerRef.current.map = null;
+      originMarkerRef.current = null;
+      infoWindowRef.current?.close();
+    };
+  }, []);
+
+  const center = originLat != null && originLng != null
     ? { lat: originLat, lng: originLng }
     : { lat: 57.5252, lng: -3.9301 };
 
   return (
     <div className="rounded-2xl overflow-hidden" style={{ border: '1px solid oklch(0.88 0.03 80)' }}>
       <MapView
-        key={`map-${originLat}-${originLng}-${places.length}`}
         className="w-full h-[55vh] min-h-[320px]"
         initialCenter={center}
         initialZoom={11}
@@ -387,86 +476,94 @@ export default function ExplorePage() {
         setUserLat(currentDay.lat);
         setUserLng(currentDay.lng);
         setLocationName(currentDay.location);
-        setGpsLoading(false);
       },
-      { timeout: 10000, enableHighAccuracy: true } // Changed to true for improved accuracy
+      // Low-accuracy is fine for "within 10 miles" — saves 5–15s on
+      // cold phones where high-accuracy forces a GPS fix.
+      { timeout: 10000, enableHighAccuracy: false, maximumAge: 60000 },
     );
-  }, [currentDay]);
-
-  useEffect(() => { 
-    loadMapScript();
-    getLocation(); 
-  }, [getLocation]);
+  }, [currentDay, manualLocation]);
 
   useEffect(() => {
-    if (userLat && userLng) search(userLat, userLng, distanceBand[0], distanceBand[1], activeFilter);
-  }, [userLat, userLng, distanceBand, search]); // Automatically search when location or distance changes
+    loadMapScript();
+    getLocation();
+  }, [getLocation]);
+
+  // Automatically search when origin or distance band changes.
+  // Category is NOT a dependency — it's a pure client-side filter below.
+  useEffect(() => {
+    if (userLat && userLng) search(userLat, userLng, distanceBand[0], distanceBand[1]);
+  }, [userLat, userLng, distanceBand, search]);
 
   function handleSearch() {
-    if (userLat && userLng) search(userLat, userLng, distanceBand[0], distanceBand[1], activeFilter);
+    if (userLat && userLng) search(userLat, userLng, distanceBand[0], distanceBand[1]);
   }
 
   function useTripLocation(day: typeof currentDay) {
     setManualLocation(true);
     const cleanLabel = day.location.split('→').pop()?.trim() || day.location;
+    const sameCoords = userLat === day.lat && userLng === day.lng;
     setUserLat(day.lat);
     setUserLng(day.lng);
     setLocationName(cleanLabel);
-    // If coords are the same, useEffect won't trigger, so we force a search manually:
-    if (userLat === day.lat && userLng === day.lng) {
-      search(day.lat, day.lng, distanceBand[0], distanceBand[1], activeFilter);
-    }
+    // If coords are the same, the useEffect above won't refire, so force a search.
+    if (sameCoords) search(day.lat, day.lng, distanceBand[0], distanceBand[1]);
   }
 
-  const filtered = activeFilter === 'all' ? places : places.filter(p => p.category === activeFilter);
+  const filtered = useMemo(
+    () => (activeFilter === 'all' ? places : places.filter(p => p.category === activeFilter)),
+    [places, activeFilter],
+  );
 
-  function fetchGoogleDetails(place: NearbyPlace) {
-    if (!window.google?.maps?.places || googleDetails[place.id] || isLoadingDetails[place.id]) return;
-    
+  const fetchGoogleDetails = useCallback((place: NearbyPlace) => {
+    const existing = googleDetails[place.id];
+    if ((existing && !existing.error) || isLoadingDetails[place.id]) return;
+
+    // localStorage cache first — skips Google Places calls entirely for
+    // places we've looked at in the last 7 days.
+    const cached = readDetailsCache(place.id);
+    if (cached) {
+      setGoogleDetails(prev => ({ ...prev, [place.id]: cached }));
+      return;
+    }
+
+    if (!window.google?.maps?.places) return;
+
     setIsLoadingDetails(prev => ({ ...prev, [place.id]: true }));
     const service = new window.google.maps.places.PlacesService(document.createElement('div'));
-    
+
     service.findPlaceFromQuery({
       query: place.name,
       fields: ['place_id'],
       locationBias: { radius: 1000, center: { lat: place.lat, lng: place.lng } }
     }, (results, status) => {
-       if (status === window.google.maps.places.PlacesServiceStatus.OK && results && results[0] && results[0].place_id) {
-           service.getDetails({
-               placeId: results[0].place_id,
-               fields: ['rating', 'user_ratings_total', 'photos', 'opening_hours', 'website', 'formatted_phone_number']
-           }, (detailRes, detailStatus) => {
-               setIsLoadingDetails(prev => ({ ...prev, [place.id]: false }));
-               if (detailStatus === window.google.maps.places.PlacesServiceStatus.OK && detailRes) {
-                   setGoogleDetails(prev => ({
-                       ...prev,
-                       [place.id]: {
-                           rating: detailRes.rating,
-                           userRatingsTotal: detailRes.user_ratings_total,
-                           photoUrl: detailRes.photos && detailRes.photos.length > 0 ? detailRes.photos[0].getUrl({ maxWidth: 400 }) : undefined,
-                           openNow: detailRes.opening_hours?.isOpen ? detailRes.opening_hours.isOpen() : undefined,
-                           weekdayText: detailRes.opening_hours?.weekday_text,
-                           website: detailRes.website,
-                           phone: detailRes.formatted_phone_number
-                       }
-                   }));
-               } else {
-                   setGoogleDetails(prev => ({
-                       ...prev,
-                       [place.id]: { error: detailStatus } as unknown as GooglePlaceDetails
-                   }));
-               }
-           });
-       } else {
-           setIsLoadingDetails(prev => ({ ...prev, [place.id]: false }));
-           console.error("Google Places Find Place failed:", status);
-           setGoogleDetails(prev => ({
-               ...prev,
-               [place.id]: { error: status } as unknown as GooglePlaceDetails
-           }));
-       }
+      if (status === window.google.maps.places.PlacesServiceStatus.OK && results && results[0] && results[0].place_id) {
+        service.getDetails({
+          placeId: results[0].place_id,
+          fields: ['rating', 'user_ratings_total', 'photos', 'opening_hours', 'website', 'formatted_phone_number']
+        }, (detailRes, detailStatus) => {
+          setIsLoadingDetails(prev => ({ ...prev, [place.id]: false }));
+          if (detailStatus === window.google.maps.places.PlacesServiceStatus.OK && detailRes) {
+            const details: GooglePlaceDetails = {
+              rating: detailRes.rating,
+              userRatingsTotal: detailRes.user_ratings_total,
+              photoUrl: detailRes.photos && detailRes.photos.length > 0 ? detailRes.photos[0].getUrl({ maxWidth: 400 }) : undefined,
+              openNow: detailRes.opening_hours?.isOpen ? detailRes.opening_hours.isOpen() : undefined,
+              weekdayText: detailRes.opening_hours?.weekday_text,
+              website: detailRes.website,
+              phone: detailRes.formatted_phone_number,
+            };
+            writeDetailsCache(place.id, details);
+            setGoogleDetails(prev => ({ ...prev, [place.id]: details }));
+          } else {
+            setGoogleDetails(prev => ({ ...prev, [place.id]: { error: detailStatus } }));
+          }
+        });
+      } else {
+        setIsLoadingDetails(prev => ({ ...prev, [place.id]: false }));
+        setGoogleDetails(prev => ({ ...prev, [place.id]: { error: status } }));
+      }
     });
-  }
+  }, [googleDetails, isLoadingDetails]);
 
   // When a pin is selected, scroll the corresponding card into view in list mode
   function handleSelectPlace(id: number | null) {
@@ -474,7 +571,7 @@ export default function ExplorePage() {
     if (id !== null) {
       const place = places.find(p => p.id === id);
       if (place) fetchGoogleDetails(place);
-      
+
       if (viewMode === 'list') {
         setTimeout(() => {
           const el = document.getElementById(`place-card-${id}`);
@@ -608,14 +705,11 @@ export default function ExplorePage() {
           </div>
         </div>
 
-        {/* Category filters */}
+        {/* Category filters — pure client-side filter, no refetch */}
         <div className="flex gap-2 overflow-x-auto pb-1 no-scrollbar">
           {CATEGORY_FILTERS.map(({ key, label, icon: Icon }) => (
-            <button key={key} 
-              onClick={() => {
-                setActiveFilter(key);
-                if (userLat && userLng) search(userLat, userLng, distanceBand[0], distanceBand[1], key);
-              }}
+            <button key={key}
+              onClick={() => setActiveFilter(key)}
               className="flex-shrink-0 flex items-center gap-1.5 px-3 py-1.5 rounded-full text-xs font-semibold transition-all hover:opacity-80"
               style={{
                 background: activeFilter === key ? 'oklch(0.72 0.14 68)' : 'oklch(0.94 0.03 80)',
@@ -689,9 +783,9 @@ export default function ExplorePage() {
                   <p className="text-xs mb-1.5 font-semibold" style={{ color: 'oklch(0.55 0.04 155)' }}>
                     Selected
                   </p>
-                  <PlaceCard 
-                    place={p} 
-                    highlight 
+                  <PlaceCard
+                    place={p}
+                    highlight
                     googleDetails={googleDetails[p.id]}
                     isLoadingDetails={isLoadingDetails[p.id]}
                   />
@@ -713,7 +807,10 @@ export default function ExplorePage() {
               </p>
             </div>
             {filtered.map(place => (
-              <div key={place.id} id={`place-card-${place.id}`}>
+              <div
+                key={place.id}
+                id={`place-card-${place.id}`}
+                style={{ contentVisibility: 'auto', containIntrinsicSize: '0 120px' } as React.CSSProperties}>
                 <PlaceCard
                   place={place}
                   highlight={false}

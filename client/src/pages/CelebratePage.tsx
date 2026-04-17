@@ -2,10 +2,14 @@ import { useState, useEffect } from "react";
 import { GlassWater, Camera, CheckSquare, Square, Wine, PartyPopper } from "lucide-react";
 import { toast } from "sonner";
 import { supabase } from "@/lib/supabase";
+import { canWrite, getPassphrase } from "@/lib/access";
+import { PhotoLightbox } from "@/components/PhotoLightbox";
 
 const TRIP_ID = 'cawdor-70';
 
-const DEFAULT_BUCKET_LIST = [
+interface BucketItem { id: string; label: string; checked: boolean }
+
+const DEFAULT_BUCKET_LIST: BucketItem[] = [
   { id: 'b1', label: 'Taste a Speyside Single Malt', checked: false },
   { id: 'b2', label: 'Spot the Loch Ness Monster', checked: false },
   { id: 'b3', label: 'Group Photo at Cawdor Castle', checked: false },
@@ -13,37 +17,63 @@ const DEFAULT_BUCKET_LIST = [
   { id: 'b5', label: 'Walk on Nairn Beach', checked: false },
 ];
 
+function isValidBucketItem(x: unknown): x is BucketItem {
+  if (!x || typeof x !== 'object') return false;
+  const o = x as Record<string, unknown>;
+  return typeof o.id === 'string'
+    && typeof o.label === 'string'
+    && typeof o.checked === 'boolean';
+}
+
+function isValidBucketList(v: unknown): v is BucketItem[] {
+  return Array.isArray(v) && v.every(isValidBucketItem);
+}
+
 export default function CelebratePage() {
   const [bucketList, setBucketList] = useState(DEFAULT_BUCKET_LIST);
   const [photos, setPhotos] = useState<string[]>([]);
+  const [lightboxIndex, setLightboxIndex] = useState<number | null>(null);
   
   useEffect(() => {
     // 1. Local Fallback Load
     try {
       const stored = localStorage.getItem('celebrate70_bucket');
-      if (stored) setBucketList(JSON.parse(stored));
+      if (stored) {
+        const parsed = JSON.parse(stored);
+        if (isValidBucketList(parsed)) setBucketList(parsed);
+      }
       const storedPhotos = localStorage.getItem('celebrate70_photos');
-      if (storedPhotos) setPhotos(JSON.parse(storedPhotos));
+      if (storedPhotos) {
+        const parsed = JSON.parse(storedPhotos);
+        if (Array.isArray(parsed) && parsed.every(p => typeof p === 'string')) {
+          setPhotos(parsed);
+        }
+      }
     } catch (e) {}
 
     // 2. Supabase Cloud Sync
-    if (supabase) {
+    const sb = supabase;
+    if (sb) {
       // Fetch initial bucket state
-      supabase.from('shared_trips').select('bucket_list_state').eq('trip_id', TRIP_ID).single()
+      sb.from('shared_trips').select('bucket_list_state').eq('trip_id', TRIP_ID).single()
         .then(({ data }) => {
-          if (data?.bucket_list_state && data.bucket_list_state.length > 0) {
-            setBucketList(data.bucket_list_state);
-            localStorage.setItem('celebrate70_bucket', JSON.stringify(data.bucket_list_state));
+          const incoming = data?.bucket_list_state;
+          if (isValidBucketList(incoming) && incoming.length > 0) {
+            setBucketList(incoming);
+            localStorage.setItem('celebrate70_bucket', JSON.stringify(incoming));
+          } else if (incoming !== undefined && incoming !== null) {
+            console.warn('Rejected malformed bucket_list_state from Supabase');
           }
         });
 
       // Subscribe to all updates
-      const channel = supabase.channel('celebrate_sync')
+      const channel = sb.channel('celebrate_sync')
         .on('postgres_changes', { event: 'UPDATE', schema: 'public', table: 'shared_trips', filter: `trip_id=eq.${TRIP_ID}` },
           (payload) => {
-            if (payload.new.bucket_list_state?.length > 0) {
-              setBucketList(payload.new.bucket_list_state);
-              localStorage.setItem('celebrate70_bucket', JSON.stringify(payload.new.bucket_list_state));
+            const next = payload.new.bucket_list_state;
+            if (isValidBucketList(next) && next.length > 0) {
+              setBucketList(next);
+              localStorage.setItem('celebrate70_bucket', JSON.stringify(next));
             }
           })
         .subscribe();
@@ -51,15 +81,16 @@ export default function CelebratePage() {
       // Fetch photos from storage bucket
       refreshPhotos();
 
-      return () => { supabase.removeChannel(channel); };
+      return () => { sb.removeChannel(channel); };
     }
   }, []);
 
   async function refreshPhotos() {
-    if (!supabase) return;
-    const { data } = await supabase.storage.from('trip-memories').list('', { sortBy: { column: 'created_at', order: 'desc' } });
+    const sb = supabase;
+    if (!sb) return;
+    const { data } = await sb.storage.from('trip-memories').list('', { sortBy: { column: 'created_at', order: 'desc' } });
     if (data) {
-      const urls = data.map(file => supabase.storage.from('trip-memories').getPublicUrl(file.name).data.publicUrl);
+      const urls = data.map(file => sb.storage.from('trip-memories').getPublicUrl(file.name).data.publicUrl);
       setPhotos(urls);
       localStorage.setItem('celebrate70_photos', JSON.stringify(urls));
     }
@@ -71,39 +102,68 @@ export default function CelebratePage() {
     localStorage.setItem('celebrate70_bucket', JSON.stringify(next));
     if (next.find(i => i.id === id)?.checked) toast.success('Bucket list item completed! 🎉');
     
-    // Broadcast to the rest of the group
-    if (supabase) {
-      supabase.from('shared_trips').update({ bucket_list_state: next }).eq('trip_id', TRIP_ID).then();
+    // Broadcast to the rest of the group (gated — read-only visitors
+    // still see their own optimistic toggle locally).
+    if (supabase && canWrite()) {
+      supabase.rpc('update_shared_trip', {
+        p_trip_id: TRIP_ID,
+        p_passphrase: getPassphrase(),
+        p_bucket_list_state: next,
+      }).then(({ error }) => {
+        if (error) console.error('Bucket list cloud sync failed:', error.message);
+      });
     }
   }
 
   async function handlePhotoUpload(e: React.ChangeEvent<HTMLInputElement>) {
     const file = e.target.files?.[0];
-    if (file) {
-      const tempUrl = URL.createObjectURL(file);
-      setPhotos([tempUrl, ...photos]); // Optimistic load
-      
-      if (supabase) {
-        toast.message("Uploading to shared group album...");
-        const filename = `${Date.now()}_${Math.random().toString(36).slice(2)}.jpg`;
-        const { error } = await supabase.storage.from('trip-memories').upload(filename, file);
-        if (error) {
-          toast.error("Upload failed: " + error.message);
-        } else {
-          toast.success("Photo shared to the group!");
-          refreshPhotos();
-        }
-      } else {
-        // Local only fallback
-        const reader = new FileReader();
-        reader.onload = (ev) => {
-          const next = [ev.target?.result as string, ...photos.filter(p => !p.startsWith('blob:'))];
-          setPhotos(next);
-          try { localStorage.setItem('celebrate70_photos', JSON.stringify(next)); } catch {}
-        };
-        reader.readAsDataURL(file);
-      }
+    if (!file) return;
+
+    // Defensive client-side checks: keeps honest users from uploading the
+    // wrong file, and keeps the bucket from filling with arbitrary payloads
+    // if the input's `accept` attribute is bypassed. Real enforcement must
+    // live in the Supabase storage policy.
+    const MAX_BYTES = 10 * 1024 * 1024; // 10 MB
+    if (!file.type.startsWith('image/')) {
+      toast.error('Only image files can be shared to the album.');
+      e.target.value = '';
+      return;
     }
+    if (file.size > MAX_BYTES) {
+      toast.error('That image is over 10MB. Please resize before uploading.');
+      e.target.value = '';
+      return;
+    }
+
+    const tempUrl = URL.createObjectURL(file);
+    setPhotos([tempUrl, ...photos]); // Optimistic load
+
+    const sb = supabase;
+    if (sb && canWrite()) {
+      toast.message("Uploading to shared group album...");
+      // Preserve the real extension so Supabase serves the right MIME.
+      const ext = (file.name.split('.').pop() || 'jpg').toLowerCase().replace(/[^a-z0-9]/g, '');
+      const filename = `${Date.now()}_${Math.random().toString(36).slice(2)}.${ext || 'jpg'}`;
+      const { error } = await sb.storage.from('trip-memories').upload(filename, file, {
+        contentType: file.type,
+      });
+      if (error) {
+        toast.error("Upload failed: " + error.message);
+      } else {
+        toast.success("Photo shared to the group!");
+        refreshPhotos();
+      }
+    } else {
+      // Local only fallback
+      const reader = new FileReader();
+      reader.onload = (ev) => {
+        const next = [ev.target?.result as string, ...photos.filter(p => !p.startsWith('blob:'))];
+        setPhotos(next);
+        try { localStorage.setItem('celebrate70_photos', JSON.stringify(next)); } catch {}
+      };
+      reader.readAsDataURL(file);
+    }
+    e.target.value = '';
   }
 
   return (
@@ -195,15 +255,28 @@ export default function CelebratePage() {
           ) : (
             <div className="grid grid-cols-2 gap-3">
               {photos.map((src, idx) => (
-                <div key={idx} className="aspect-[4/5] rounded-xl overflow-hidden bg-gray-100 border relative shadow-sm" style={{ borderColor: 'oklch(0.88 0.03 80)' }}>
-                  <img src={src} className="w-full h-full object-cover transition-opacity duration-300" alt={`Memory ${idx}`} />
-                </div>
+                <button
+                  key={idx}
+                  type="button"
+                  onClick={() => setLightboxIndex(idx)}
+                  aria-label={`Open memory ${idx + 1}`}
+                  className="aspect-[4/5] rounded-xl overflow-hidden bg-gray-100 border relative shadow-sm cursor-zoom-in focus:outline-none focus:ring-2 focus:ring-offset-2"
+                  style={{ borderColor: 'oklch(0.88 0.03 80)' }}>
+                  <img src={src} className="w-full h-full object-cover transition-opacity duration-300" alt={`Memory ${idx + 1}`} />
+                </button>
               ))}
             </div>
           )}
         </div>
-        
+
       </div>
+
+      <PhotoLightbox
+        photos={photos}
+        index={lightboxIndex}
+        onClose={() => setLightboxIndex(null)}
+        onIndexChange={setLightboxIndex}
+      />
     </div>
   );
 }
