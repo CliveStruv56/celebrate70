@@ -5,6 +5,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { defineConfig, type Plugin, type ViteDevServer } from "vite";
 import { vitePluginManusRuntime } from "vite-plugin-manus-runtime";
+import { VitePWA } from "vite-plugin-pwa";
 
 // =============================================================================
 // Manus Debug Collector - Vite Plugin
@@ -150,7 +151,77 @@ function vitePluginManusDebugCollector(): Plugin {
   };
 }
 
-const plugins = [react(), tailwindcss(), jsxLocPlugin(), vitePluginManusRuntime(), vitePluginManusDebugCollector()];
+const pwaPlugin = VitePWA({
+  registerType: "autoUpdate",
+  // Keep the existing /manifest.json path so any old install references
+  // still resolve. The plugin will overwrite the static file at build.
+  filename: "sw.js",
+  manifestFilename: "manifest.json",
+  includeAssets: ["icon-192.png", "icon-512.png"],
+  manifest: {
+    name: "Celebrate 70",
+    short_name: "Celebrate 70",
+    description: "Clive & Jane's Scotland & Orkney adventure — April 2026",
+    start_url: "/",
+    display: "standalone",
+    background_color: "#1a3a2a",
+    theme_color: "#1a3a2a",
+    orientation: "portrait",
+    icons: [
+      { src: "/icon-192.png", sizes: "192x192", type: "image/png", purpose: "any maskable" },
+      { src: "/icon-512.png", sizes: "512x512", type: "image/png", purpose: "any maskable" },
+    ],
+  },
+  workbox: {
+    globPatterns: ["**/*.{js,css,html,ico,png,svg,webp,woff,woff2,pdf}"],
+    // The itinerary-route tiles + CloudFront hero photos are the only
+    // external resources we want available offline. Overpass API is
+    // intentionally NetworkOnly — our hook already does its own caching
+    // in localStorage and SW caching would duplicate that state.
+    runtimeCaching: [
+      {
+        // CloudFront hero photos — our own CDN, heavy but rarely changes.
+        urlPattern: ({ url }) => url.origin === "https://d2xsxph8kpxj0f.cloudfront.net",
+        handler: "StaleWhileRevalidate",
+        options: {
+          cacheName: "cloudfront-images",
+          expiration: { maxEntries: 60, maxAgeSeconds: 60 * 60 * 24 * 30 },
+          cacheableResponse: { statuses: [0, 200] },
+        },
+      },
+      {
+        // Google Maps JS loader + tiles + markers.
+        urlPattern: ({ url }) =>
+          /^https:\/\/(maps\.googleapis\.com|maps\.gstatic\.com)/.test(url.href),
+        handler: "CacheFirst",
+        options: {
+          cacheName: "google-maps",
+          expiration: { maxEntries: 150, maxAgeSeconds: 60 * 60 * 24 * 7 },
+          cacheableResponse: { statuses: [0, 200] },
+        },
+      },
+      {
+        // Google Fonts (Playfair Display + Source Sans 3).
+        urlPattern: ({ url }) => /fonts\.(googleapis|gstatic)\.com/.test(url.hostname),
+        handler: "StaleWhileRevalidate",
+        options: { cacheName: "google-fonts", cacheableResponse: { statuses: [0, 200] } },
+      },
+      {
+        // Overpass API: never cache via SW — the hook has its own cache
+        // and we don't want stale nearby results persisting.
+        urlPattern: ({ url }) => /overpass/.test(url.hostname),
+        handler: "NetworkOnly",
+      },
+    ],
+    navigateFallback: "index.html",
+    navigateFallbackDenylist: [/^\/__manus__/, /^\/docs\//],
+  },
+  devOptions: {
+    enabled: false,
+  },
+});
+
+const plugins = [react(), tailwindcss(), jsxLocPlugin(), vitePluginManusRuntime(), vitePluginManusDebugCollector(), pwaPlugin];
 
 export default defineConfig({
   plugins,

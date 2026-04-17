@@ -5,9 +5,10 @@
 // =============================================================
 
 import { useState, useEffect } from "react";
-import { MapPin, Clock, ChevronRight, Anchor, Home, Car, CheckCircle2, Star } from "lucide-react";
+import { MapPin, Clock, ChevronRight, Anchor, Home, Car, CheckCircle2, Star, FileText } from "lucide-react";
 import { useItinerary, getCurrentDayIndex, getNextEvent, type TripEvent, type TripDay } from "@/lib/itinerary";
 import EventCard from "@/components/EventCard";
+import { WeatherStrip } from "@/components/WeatherStrip";
 
 function formatTime(date: Date) {
   return date.toLocaleTimeString('en-GB', { hour: '2-digit', minute: '2-digit' });
@@ -117,6 +118,8 @@ export default function TodayPage() {
           </div>
         )}
 
+        <WeatherStrip lat={displayDay.lat} lng={displayDay.lng} locationLabel={displayDay.location.split('→').pop()?.trim()} />
+
         {/* Day Headline */}
         <div className="mb-3">
           <h2 className="text-xl font-bold" style={{ color: 'oklch(0.20 0.03 155)', fontFamily: "'Playfair Display', serif" }}>
@@ -138,6 +141,62 @@ export default function TodayPage() {
             />
           ))}
         </div>
+
+        <TripDocuments />
+      </div>
+    </div>
+  );
+}
+
+const TRIP_DOCUMENTS: { label: string; sub: string; href: string }[] = [
+  {
+    label: 'NorthLink — Stromness → Scrabster',
+    sub: 'Ferry booking confirmation',
+    href: '/docs/northlink-stromness-scrabster.pdf',
+  },
+  {
+    label: 'Pentland — Gills Bay crossing',
+    sub: 'Ferry booking confirmation',
+    href: '/docs/pentland-ferries-gills-bay.pdf',
+  },
+  {
+    label: 'NorthLink — Vehicle driver notice',
+    sub: 'Pre-boarding instructions',
+    href: '/docs/northlink-vehicle-notice.pdf',
+  },
+];
+
+function TripDocuments() {
+  return (
+    <div className="mt-6">
+      <h3 className="text-xs font-semibold uppercase tracking-wider mb-2"
+        style={{ color: 'oklch(0.55 0.04 155)' }}>
+        Documents
+      </h3>
+      <div className="rounded-2xl overflow-hidden"
+        style={{ background: 'oklch(1 0 0)', border: '1px solid oklch(0.88 0.03 80)' }}>
+        {TRIP_DOCUMENTS.map((doc, i) => (
+          <a
+            key={doc.href}
+            href={doc.href}
+            target="_blank"
+            rel="noopener noreferrer"
+            className="flex items-center gap-3 p-3 hover:bg-gray-50"
+            style={{ borderTop: i === 0 ? 'none' : '1px solid oklch(0.94 0.03 80)' }}>
+            <div className="w-9 h-9 rounded-full flex-shrink-0 flex items-center justify-center"
+              style={{ background: 'oklch(0.28 0.07 155 / 0.08)' }}>
+              <FileText size={16} style={{ color: 'oklch(0.28 0.07 155)' }} />
+            </div>
+            <div className="flex-1 min-w-0">
+              <div className="text-sm font-semibold truncate"
+                style={{ color: 'oklch(0.20 0.03 155)', fontFamily: "'Playfair Display', serif" }}>
+                {doc.label}
+              </div>
+              <div className="text-[11px]" style={{ color: 'oklch(0.55 0.04 155)' }}>{doc.sub}</div>
+            </div>
+            <ChevronRight size={14} style={{ color: 'oklch(0.55 0.04 155)' }} />
+          </a>
+        ))}
       </div>
     </div>
   );

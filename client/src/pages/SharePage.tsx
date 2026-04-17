@@ -1,9 +1,10 @@
 // CELEBRATE 70 — Share Page
 // QR code for friends to install the PWA
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { QRCodeSVG } from "qrcode.react";
-import { Copy, Share2, Download, Users, Smartphone, CheckCircle2 } from "lucide-react";
+import { Copy, Share2, Download, Users, Smartphone, CheckCircle2, Lock, Unlock } from "lucide-react";
 import { toast } from "sonner";
+import { canWrite, unlock, lock, onAccessChange } from "@/lib/access";
 
 const APP_URL = typeof window !== 'undefined' ? window.location.origin : 'https://celebrate70.manus.space';
 
@@ -16,6 +17,26 @@ const INSTALL_STEPS = [
 
 export default function SharePage() {
   const [copied, setCopied] = useState(false);
+  const [unlocked, setUnlocked] = useState(canWrite());
+  const [phrase, setPhrase] = useState("");
+  const [showPrompt, setShowPrompt] = useState(false);
+
+  useEffect(() => onAccessChange(() => setUnlocked(canWrite())), []);
+
+  function handleUnlock() {
+    if (unlock(phrase)) {
+      toast.success("Editing unlocked. Your changes will now sync to the group.");
+      setPhrase("");
+      setShowPrompt(false);
+    } else {
+      toast.error("That passphrase didn't match.");
+    }
+  }
+
+  function handleLock() {
+    lock();
+    toast.message("Editing locked. Local changes only on this device.");
+  }
 
   function copyLink() {
     navigator.clipboard.writeText(APP_URL).then(() => {
@@ -127,6 +148,58 @@ export default function SharePage() {
               </div>
             </div>
           ))}
+        </div>
+
+        {/* Editing access — gate for cloud writes */}
+        <div className="rounded-2xl p-4"
+          style={{ background: 'oklch(1 0 0)', border: '1px solid oklch(0.88 0.03 80)' }}>
+          <div className="flex items-center gap-2 mb-1">
+            {unlocked
+              ? <Unlock size={16} style={{ color: 'oklch(0.45 0.14 155)' }} />
+              : <Lock size={16} style={{ color: 'oklch(0.28 0.07 155)' }} />}
+            <h2 className="font-bold text-base" style={{ color: 'oklch(0.20 0.03 155)', fontFamily: "'Playfair Display', serif" }}>
+              Editing access
+            </h2>
+          </div>
+          <p className="text-xs" style={{ color: 'oklch(0.55 0.04 155)' }}>
+            {unlocked
+              ? 'This device can save itinerary edits, bucket-list toggles, and photo uploads to the shared album.'
+              : 'You can view everything. Enter the trip passphrase to save changes for the whole group.'}
+          </p>
+
+          {unlocked ? (
+            <button onClick={handleLock}
+              className="mt-3 flex items-center gap-2 px-3 py-2 rounded-xl text-sm font-semibold"
+              style={{ background: 'oklch(0.94 0.03 80)', color: 'oklch(0.28 0.07 155)' }}>
+              <Lock size={14} />
+              Lock editing
+            </button>
+          ) : showPrompt ? (
+            <div className="mt-3 flex gap-2">
+              <input
+                type="password"
+                autoFocus
+                placeholder="Trip passphrase"
+                value={phrase}
+                onChange={e => setPhrase(e.target.value)}
+                onKeyDown={e => e.key === 'Enter' && handleUnlock()}
+                className="flex-1 px-3 py-2 rounded-xl text-sm outline-none"
+                style={{ background: 'oklch(0.94 0.03 80)', color: 'oklch(0.20 0.03 155)', border: '1px solid oklch(0.88 0.03 80)' }}
+              />
+              <button onClick={handleUnlock}
+                className="px-3 py-2 rounded-xl text-sm font-semibold"
+                style={{ background: 'oklch(0.28 0.07 155)', color: 'oklch(0.97 0.02 85)' }}>
+                Unlock
+              </button>
+            </div>
+          ) : (
+            <button onClick={() => setShowPrompt(true)}
+              className="mt-3 flex items-center gap-2 px-3 py-2 rounded-xl text-sm font-semibold"
+              style={{ background: 'oklch(0.28 0.07 155)', color: 'oklch(0.97 0.02 85)' }}>
+              <Unlock size={14} />
+              Unlock editing
+            </button>
+          )}
         </div>
 
         {/* Trip info card */}

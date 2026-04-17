@@ -1,14 +1,20 @@
 // =============================================================
-// CELEBRATE 70 — Nearby Places Hook (v4)
-// Two-pass Overpass strategy:
-//   Pass 1: node + way elements (fast, most amenities & pubs)
-//   Pass 2: relation elements (castles, estates, large sites)
-//   Both passes use `out center tags` which reliably returns
-//   a centroid for all geometry types.
-//   Results are merged, de-duplicated and sorted by distance.
+// CELEBRATE 70 — Nearby Places Hook (v5)
+//
+// Strategy:
+//   - Always fetch category = "all" for a given origin + radius.
+//     Category filtering happens in the component, not on the wire.
+//     (Tapping a chip no longer refetches.)
+//   - 24h localStorage cache keyed on (rounded lat/lng, radius bucket).
+//   - AbortController + request ID: in-flight requests are cancelled
+//     when the user changes origin/radius; stale responses are dropped.
+//   - On failure, auto-retry once at half the radius before surfacing
+//     an error to the user.
+//   - Mirror race via Promise.any stays, but the losers' fetches are
+//     aborted the moment the first mirror succeeds.
 // =============================================================
 
-import { useState, useCallback } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 
 export type PlaceCategory = 'restaurant' | 'pub' | 'attraction' | 'activity' | 'cafe' | 'accommodation';
 
@@ -33,29 +39,38 @@ const OVERPASS_MIRRORS = [
   'https://maps.mail.ru/osm/tools/overpass/api/interpreter',
 ];
 
-// ── Query builders ────────────────────────────────────────────
+const CACHE_PREFIX = 'celebrate70_nearby_v1:';
+const CACHE_TTL_MS = 24 * 60 * 60 * 1000;
+const MIRROR_TIMEOUT_MS = 20_000;
 
-function buildQueryForCategory(lat: number, lng: number, maxR: number, category: PlaceCategory | 'all'): string {
-  const o = (k: string, v: string) => `nwr["${k}"="${v}"](around:${maxR},${lat},${lng});\n`;
-  
-  const tagsEat = ['restaurant', 'fast_food', 'food_court'].map(v => o('amenity', v)).join('');
-  const tagsDrink = ['pub', 'bar', 'biergarten'].map(v => o('amenity', v)).join('');
-  const tagsCafe = o('amenity', 'cafe');
-  const tagsHistoric = ['castle', 'fort', 'manor', 'stately_home', 'country_house', 'estate', 'abbey', 'priory', 'cathedral', 'church', 'ruins', 'archaeological_site', 'battlefield', 'tower', 'building'].map(v => o('historic', v)).join('');
-  const tagsTourism = ['attraction', 'museum', 'gallery', 'viewpoint', 'theme_park', 'zoo', 'aquarium', 'artwork', 'picnic_site', 'camp_site'].map(v => o('tourism', v)).join('');
-  const tagsNature = ['peak', 'cliff', 'cave_entrance', 'beach', 'hot_spring', 'waterfall', 'bay', 'cape'].map(v => o('natural', v)).join('') + o('waterway', 'waterfall') + ['nature_reserve', 'park', 'garden', 'bird_hide'].map(v => o('leisure', v)).join('');
-  const tagsLeisure = ['golf_course', 'sports_centre', 'swimming_pool', 'fitness_centre', 'marina', 'fishing', 'horse_riding', 'miniature_golf', 'water_park'].map(v => o('leisure', v)).join('');
-  const tagsCraft = ['distillery', 'winery', 'brewery', 'smokehouse'].map(v => o('craft', v)).join('') + ['distillery', 'winery', 'brewery', 'farm', 'deli', 'seafood'].map(v => o('shop', v)).join('');
-  
-  let queries = '';
-  if (category === 'restaurant') queries = tagsEat;
-  else if (category === 'pub') queries = tagsDrink;
-  else if (category === 'cafe') queries = tagsCafe;
-  else if (category === 'attraction') queries = tagsHistoric + tagsTourism + tagsNature;
-  else if (category === 'activity') queries = tagsLeisure + tagsCraft;
-  else queries = tagsEat + tagsDrink + tagsCafe + tagsHistoric + tagsTourism + tagsNature + tagsLeisure + tagsCraft;
+// ── Query builder ─────────────────────────────────────────────
+// Always queries "all" — categories are applied in-memory later.
+// Dropped `historic=building` (previously matched every tagged
+// building in the bbox, which was the single largest source of
+// noise and query time).
+function buildAllQuery(lat: number, lng: number, maxR: number): string {
+  const nwr = (k: string, v: string) => `nwr["${k}"="${v}"](around:${maxR},${lat},${lng});`;
 
-  return `[out:json][timeout:30];\n(\n${queries});\nout center tags;`;
+  const amenities = ['restaurant', 'fast_food', 'food_court', 'pub', 'bar', 'biergarten', 'cafe', 'theatre', 'cinema', 'arts_centre'];
+  const historic = ['castle', 'fort', 'manor', 'stately_home', 'country_house', 'estate', 'abbey', 'priory', 'cathedral', 'church', 'ruins', 'archaeological_site', 'battlefield', 'tower', 'monument', 'memorial', 'folly'];
+  const tourism = ['attraction', 'museum', 'gallery', 'viewpoint', 'theme_park', 'zoo', 'aquarium', 'artwork', 'picnic_site', 'camp_site', 'information'];
+  const natural = ['peak', 'cliff', 'cave_entrance', 'beach', 'hot_spring', 'waterfall', 'bay', 'cape'];
+  const leisure = ['nature_reserve', 'park', 'garden', 'bird_hide', 'golf_course', 'sports_centre', 'swimming_pool', 'fitness_centre', 'marina', 'fishing', 'horse_riding', 'miniature_golf', 'water_park'];
+  const craft = ['distillery', 'winery', 'brewery', 'smokehouse'];
+  const shop = ['distillery', 'winery', 'brewery', 'farm', 'deli', 'seafood', 'outdoor', 'sports', 'gift', 'craft'];
+
+  const parts: string[] = [
+    ...amenities.map(v => nwr('amenity', v)),
+    ...historic.map(v => nwr('historic', v)),
+    ...tourism.map(v => nwr('tourism', v)),
+    ...natural.map(v => nwr('natural', v)),
+    nwr('waterway', 'waterfall'),
+    ...leisure.map(v => nwr('leisure', v)),
+    ...craft.map(v => nwr('craft', v)),
+    ...shop.map(v => nwr('shop', v)),
+  ];
+
+  return `[out:json][timeout:25];(${parts.join('')});out center tags;`;
 }
 
 // ── Classification ────────────────────────────────────────────
@@ -81,7 +96,7 @@ function classifyPlace(tags: Record<string, string>): { category: PlaceCategory;
     return { category: 'attraction', label: 'Historic Church' };
   if (['ruins', 'archaeological_site', 'battlefield'].includes(historic))
     return { category: 'attraction', label: 'Historic Site' };
-  if (['monument', 'memorial', 'tower', 'folly', 'building'].includes(historic))
+  if (['monument', 'memorial', 'tower', 'folly'].includes(historic))
     return { category: 'attraction', label: 'Monument' };
 
   if (['museum', 'gallery'].includes(tourism)) return { category: 'attraction', label: 'Museum / Gallery' };
@@ -114,7 +129,7 @@ function classifyPlace(tags: Record<string, string>): { category: PlaceCategory;
   return { category: 'attraction', label: 'Point of Interest' };
 }
 
-// ── Geometry helpers ──────────────────────────────────────────
+// ── Geometry ──────────────────────────────────────────────────
 
 function haversine(lat1: number, lng1: number, lat2: number, lng2: number): number {
   const R = 3958.8;
@@ -128,44 +143,44 @@ function haversine(lat1: number, lng1: number, lat2: number, lng2: number): numb
   return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
 }
 
-// ── Network helpers ───────────────────────────────────────────
+// ── Network ───────────────────────────────────────────────────
 
-async function fetchJsonWithTimeout(url: string, body: string, timeoutMs: number = 20000): Promise<unknown> {
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), timeoutMs);
-  try {
-    const res = await fetch(url, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-      body: `data=${encodeURIComponent(body)}`,
-      signal: controller.signal,
-    });
-    if (!res.ok) {
-      throw new Error(`HTTP ${res.status}`);
-    }
-    const data = await res.json();
-    clearTimeout(timer);
-    return data;
-  } catch (err) {
-    clearTimeout(timer);
-    throw err;
-  }
+async function fetchOverpass(mirror: string, query: string, signal: AbortSignal): Promise<unknown[]> {
+  const res = await fetch(mirror, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: `data=${encodeURIComponent(query)}`,
+    signal,
+  });
+  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  const data = (await res.json()) as { elements?: unknown[] };
+  return data.elements ?? [];
 }
 
-async function runQuery(query: string): Promise<unknown[]> {
-  const promises = OVERPASS_MIRRORS.map(async (mirror) => {
-    const data = await fetchJsonWithTimeout(mirror, query, 20000) as { elements?: unknown[] };
-    return data.elements ?? [];
+async function runQuery(query: string, parentSignal: AbortSignal): Promise<unknown[]> {
+  // Per-mirror AbortController so the winners can cancel the losers.
+  const controllers = OVERPASS_MIRRORS.map(() => new AbortController());
+  const onParentAbort = () => controllers.forEach(c => c.abort());
+  parentSignal.addEventListener('abort', onParentAbort);
+
+  // Overall budget: Promise.any short-circuits on first success.
+  const attempts = OVERPASS_MIRRORS.map((mirror, i) => {
+    const timer = setTimeout(() => controllers[i].abort(), MIRROR_TIMEOUT_MS);
+    return fetchOverpass(mirror, query, controllers[i].signal)
+      .finally(() => clearTimeout(timer));
   });
 
   try {
-    return await Promise.any(promises);
-  } catch {
-    throw new Error('All OpenStreetMap mirrors timed out or failed. Please reduce radius and try again.');
+    const elements = await Promise.any(attempts);
+    // Cancel losers
+    controllers.forEach(c => c.abort());
+    return elements;
+  } finally {
+    parentSignal.removeEventListener('abort', onParentAbort);
   }
 }
 
-// ── Element → NearbyPlace ─────────────────────────────────────
+// ── Parse ─────────────────────────────────────────────────────
 
 interface OsmElement {
   type: string;
@@ -176,13 +191,9 @@ interface OsmElement {
   tags?: Record<string, string>;
 }
 
-function parseElements(
-  elements: unknown[],
-  originLat: number,
-  originLng: number,
-  seen: Set<string>
-): NearbyPlace[] {
-  const results: NearbyPlace[] = [];
+function parseElements(elements: unknown[], originLat: number, originLng: number): NearbyPlace[] {
+  const seen = new Set<string>();
+  const out: NearbyPlace[] = [];
   for (const el of elements as OsmElement[]) {
     const tags = el.tags || {};
     const name = tags.name;
@@ -190,7 +201,7 @@ function parseElements(
 
     const elLat = el.lat ?? el.center?.lat;
     const elLng = el.lon ?? el.center?.lon;
-    if (!elLat || !elLng) continue;
+    if (elLat == null || elLng == null) continue;
 
     seen.add(name.toLowerCase());
     const { category, label } = classifyPlace(tags);
@@ -203,7 +214,7 @@ function parseElements(
       tags['addr:postcode'],
     ].filter(Boolean);
 
-    results.push({
+    out.push({
       id: el.id,
       name,
       category,
@@ -218,46 +229,127 @@ function parseElements(
       tags,
     });
   }
-  return results;
+  return out;
 }
 
-// ── Main query function ───────────────────────────────────────
+// ── Cache ─────────────────────────────────────────────────────
 
-async function queryOverpass(lat: number, lng: number, radiusMetres: number, category: PlaceCategory | 'all'): Promise<NearbyPlace[]> {
-  const r = Math.min(radiusMetres, 50000);
-
-  // Run the combined fast query over our network of mirrors
-  const elements = await runQuery(buildQueryForCategory(lat, lng, r, category));
-
-  const seen = new Set<string>();
-  const results: NearbyPlace[] = parseElements(elements, lat, lng, seen);
-
-  return results;
+function cacheKey(lat: number, lng: number, maxMiles: number): string {
+  // Round to ~1km so nearby searches hit the same bucket.
+  const rLat = Math.round(lat * 100) / 100;
+  const rLng = Math.round(lng * 100) / 100;
+  // Bucket radius so e.g. 10/20/30 are distinct entries.
+  const rMiles = Math.ceil(maxMiles / 5) * 5;
+  return `${CACHE_PREFIX}${rLat},${rLng},${rMiles}`;
 }
 
-// ── React hook ────────────────────────────────────────────────
+interface CacheEntry { ts: number; places: NearbyPlace[] }
+
+function readCache(key: string): NearbyPlace[] | null {
+  try {
+    const raw = localStorage.getItem(key);
+    if (!raw) return null;
+    const parsed = JSON.parse(raw) as CacheEntry;
+    if (Date.now() - parsed.ts > CACHE_TTL_MS) return null;
+    return parsed.places;
+  } catch {
+    return null;
+  }
+}
+
+function writeCache(key: string, places: NearbyPlace[]) {
+  try {
+    const entry: CacheEntry = { ts: Date.now(), places };
+    localStorage.setItem(key, JSON.stringify(entry));
+  } catch {
+    /* quota exceeded; ignore */
+  }
+}
+
+// ── Fetch with auto-narrow fallback ───────────────────────────
+
+async function fetchPlaces(
+  lat: number, lng: number, maxMiles: number, parentSignal: AbortSignal
+): Promise<NearbyPlace[]> {
+  const radiusMetres = Math.round(Math.min(maxMiles, 40) * 1609.34);
+  try {
+    const elements = await runQuery(buildAllQuery(lat, lng, radiusMetres), parentSignal);
+    return parseElements(elements, lat, lng);
+  } catch (err) {
+    // Don't retry if the caller cancelled us.
+    if (parentSignal.aborted) throw err;
+    // Auto-narrow once: half the radius tends to succeed when the
+    // full-radius query times out at Overpass.
+    const halfR = Math.round(radiusMetres / 2);
+    if (halfR < 1000) throw err; // <~0.6 mi is pointless
+    const elements = await runQuery(buildAllQuery(lat, lng, halfR), parentSignal);
+    return parseElements(elements, lat, lng);
+  }
+}
+
+// ── Cache priming (used to warm trip anchors on app boot) ────
+
+const inFlightPrime = new Set<string>();
+
+export async function primeNearbyCache(lat: number, lng: number, maxMiles: number = 10): Promise<void> {
+  const key = cacheKey(lat, lng, maxMiles);
+  if (inFlightPrime.has(key) || readCache(key)) return;
+  inFlightPrime.add(key);
+  const controller = new AbortController();
+  try {
+    const raw = await fetchPlaces(lat, lng, maxMiles, controller.signal);
+    writeCache(key, raw);
+  } catch {
+    /* prefetch is best-effort */
+  } finally {
+    inFlightPrime.delete(key);
+  }
+}
+
+// ── Hook ──────────────────────────────────────────────────────
 
 export function useNearbyPlaces() {
   const [places, setPlaces] = useState<NearbyPlace[]>([]);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [lastSearch, setLastSearch] = useState<{ lat: number; lng: number; minMiles: number; maxMiles: number; category: PlaceCategory | 'all' } | null>(null);
+  const [lastSearch, setLastSearch] = useState<{ lat: number; lng: number; minMiles: number; maxMiles: number } | null>(null);
 
-  const search = useCallback(async (lat: number, lng: number, minMiles: number = 0, maxMiles: number = 20, category: PlaceCategory | 'all' = 'all') => {
-    setLoading(true);
+  // Stale-response guard: only the most recent request may set state.
+  const requestSeq = useRef(0);
+  const activeController = useRef<AbortController | null>(null);
+
+  const search = useCallback(async (lat: number, lng: number, minMiles: number = 0, maxMiles: number = 20) => {
+    // Cancel any in-flight request
+    activeController.current?.abort();
+    const controller = new AbortController();
+    activeController.current = controller;
+    const seq = ++requestSeq.current;
+
+    setLastSearch({ lat, lng, minMiles, maxMiles });
     setError(null);
-    const radiusMetres = Math.round(Math.min(maxMiles, 40) * 1609.34);
 
+    const key = cacheKey(lat, lng, maxMiles);
+    const cached = readCache(key);
+    if (cached) {
+      if (seq !== requestSeq.current) return;
+      const filtered = cached.filter(p => (p.distanceMiles ?? 999) >= minMiles && (p.distanceMiles ?? 999) <= maxMiles);
+      setPlaces(filtered.slice(0, 200));
+      setLoading(false);
+      return;
+    }
+
+    setLoading(true);
     try {
-      const rawResults = await queryOverpass(lat, lng, radiusMetres, category);
-      
-      // Filter out anything falling in the inner hole of our distance ring
-      const ringFiltered = rawResults.filter(p => p.distanceMiles !== undefined && p.distanceMiles >= minMiles);
-      ringFiltered.sort((a, b) => (a.distanceMiles ?? 999) - (b.distanceMiles ?? 999));
-      
-      setPlaces(ringFiltered.slice(0, 200));
-      setLastSearch({ lat, lng, minMiles, maxMiles, category });
+      const raw = await fetchPlaces(lat, lng, maxMiles, controller.signal);
+      if (seq !== requestSeq.current) return; // stale
+      writeCache(key, raw);
+      const filtered = raw
+        .filter(p => (p.distanceMiles ?? 999) >= minMiles && (p.distanceMiles ?? 999) <= maxMiles)
+        .sort((a, b) => (a.distanceMiles ?? 999) - (b.distanceMiles ?? 999));
+      setPlaces(filtered.slice(0, 200));
     } catch (err) {
+      if (seq !== requestSeq.current) return; // stale
+      if (controller.signal.aborted) return; // user-initiated cancel
       const msg = err instanceof Error ? err.message : 'Search failed';
       if (msg.includes('504') || msg.includes('timeout') || msg.includes('abort')) {
         setError('The map data server timed out. Try a smaller radius or tap Try Again.');
@@ -267,8 +359,13 @@ export function useNearbyPlaces() {
         setError(`Could not load nearby places: ${msg}`);
       }
     } finally {
-      setLoading(false);
+      if (seq === requestSeq.current) setLoading(false);
     }
+  }, []);
+
+  // Abort any in-flight request when the hook unmounts.
+  useEffect(() => {
+    return () => activeController.current?.abort();
   }, []);
 
   return { places, loading, error, search, lastSearch };

@@ -2,6 +2,7 @@
 import { Anchor, Home, Car, Coffee, MapPin, ChevronDown, ChevronUp, ExternalLink, Copy } from "lucide-react";
 import type { TripEvent, EventType } from "@/lib/itinerary";
 import { toast } from "sonner";
+import { safeUrl } from "@/lib/safeUrl";
 
 function EventIcon({ type }: { type: EventType }) {
   const base = "w-8 h-8 rounded-full flex items-center justify-center flex-shrink-0 relative z-10";
@@ -137,14 +138,17 @@ export default function EventCard({ event, isExpanded, onToggle }: EventCardProp
                 )}
               </div>
             )}
-            {event.mapUrl && (
-              <a href={event.mapUrl} target="_blank" rel="noopener noreferrer"
-                className="flex items-center gap-1.5 text-xs font-semibold"
-                style={{ color: 'oklch(0.28 0.07 155)' }}>
-                <ExternalLink size={12} />
-                Open in Maps
-              </a>
-            )}
+            {(() => {
+              const href = safeUrl(event.mapUrl);
+              return href ? (
+                <a href={href} target="_blank" rel="noopener noreferrer"
+                  className="flex items-center gap-1.5 text-xs font-semibold"
+                  style={{ color: 'oklch(0.28 0.07 155)' }}>
+                  <ExternalLink size={12} />
+                  Open in Maps
+                </a>
+              ) : null;
+            })()}
           </div>
         )}
       </div>
