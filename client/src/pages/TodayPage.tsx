@@ -5,6 +5,7 @@
 // =============================================================
 
 import { useState, useEffect } from "react";
+import { useLocation } from "wouter";
 import { MapPin, Clock, ChevronRight, Anchor, Home, Car, CheckCircle2, Star, FileText } from "lucide-react";
 import { useItinerary, getCurrentDayIndex, getNextEvent, type TripEvent, type TripDay } from "@/lib/itinerary";
 import EventCard from "@/components/EventCard";
@@ -45,6 +46,7 @@ function TripStatusBanner({ dayIndex, tripDays }: { dayIndex: number, tripDays: 
 
 export default function TodayPage() {
   const tripDays = useItinerary();
+  const [, navigate] = useLocation();
   const [now, setNow] = useState(new Date());
   const [expandedEvent, setExpandedEvent] = useState<string | null>(null);
   const dayIndex = getCurrentDayIndex();
@@ -103,19 +105,27 @@ export default function TodayPage() {
 
         {/* Next Event Banner */}
         {nextEvent && (
-          <div className="mb-4 rounded-2xl p-4"
+          <button
+            type="button"
+            onClick={() => navigate(`/journey#event-${nextEvent.id}`)}
+            className="w-full text-left mb-4 rounded-2xl p-4 transition-transform active:scale-[0.98]"
             style={{ background: 'linear-gradient(135deg, oklch(0.72 0.14 68 / 0.15), oklch(0.72 0.14 68 / 0.05))', border: '1px solid oklch(0.72 0.14 68 / 0.3)' }}>
-            <div className="flex items-center gap-2 mb-1">
-              <Clock size={14} style={{ color: 'oklch(0.72 0.14 68)' }} />
-              <span className="text-xs font-semibold uppercase tracking-wider" style={{ color: 'oklch(0.72 0.14 68)' }}>Next Up</span>
+            <div className="flex items-center justify-between gap-2">
+              <div className="flex-1 min-w-0">
+                <div className="flex items-center gap-2 mb-1">
+                  <Clock size={14} style={{ color: 'oklch(0.72 0.14 68)' }} />
+                  <span className="text-xs font-semibold uppercase tracking-wider" style={{ color: 'oklch(0.72 0.14 68)' }}>Next Up</span>
+                </div>
+                <div className="font-bold text-base" style={{ color: 'oklch(0.20 0.03 155)', fontFamily: "'Playfair Display', serif" }}>
+                  {nextEvent.title}
+                </div>
+                {nextEvent.time && (
+                  <div className="text-sm mt-0.5" style={{ color: 'oklch(0.45 0.04 155)' }}>{nextEvent.time}</div>
+                )}
+              </div>
+              <ChevronRight size={18} className="flex-shrink-0" style={{ color: 'oklch(0.72 0.14 68)' }} />
             </div>
-            <div className="font-bold text-base" style={{ color: 'oklch(0.20 0.03 155)', fontFamily: "'Playfair Display', serif" }}>
-              {nextEvent.title}
-            </div>
-            {nextEvent.time && (
-              <div className="text-sm mt-0.5" style={{ color: 'oklch(0.45 0.04 155)' }}>{nextEvent.time}</div>
-            )}
-          </div>
+          </button>
         )}
 
         <WeatherStrip lat={displayDay.lat} lng={displayDay.lng} locationLabel={displayDay.location.split('→').pop()?.trim()} />

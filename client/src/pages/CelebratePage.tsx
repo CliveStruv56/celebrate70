@@ -88,12 +88,32 @@ export default function CelebratePage() {
   async function refreshPhotos() {
     const sb = supabase;
     if (!sb) return;
-    const { data } = await sb.storage.from('trip-memories').list('', { sortBy: { column: 'created_at', order: 'desc' } });
-    if (data) {
-      const urls = data.map(file => sb.storage.from('trip-memories').getPublicUrl(file.name).data.publicUrl);
-      setPhotos(urls);
-      localStorage.setItem('celebrate70_photos', JSON.stringify(urls));
+    const { data, error } = await sb.storage
+      .from('trip-memories')
+      .list('', { sortBy: { column: 'created_at', order: 'desc' } });
+    if (error) {
+      console.error('Photo list failed:', error.message);
+      return;
     }
+    if (!data) return;
+    const cloudUrls = data.map(
+      file => sb.storage.from('trip-memories').getPublicUrl(file.name).data.publicUrl
+    );
+    setPhotos(prev => {
+      // Preserve locally-stored photos (data: URLs) that haven't been
+      // uploaded to the cloud yet, and keep any already-known cloud URL
+      // that the current listing didn't return (e.g. anon RLS blocks list).
+      const localOnly = prev.filter(p => p.startsWith('data:'));
+      const cloudSet = new Set(cloudUrls);
+      const existingCloud = prev.filter(
+        p => p.startsWith('http') && !cloudSet.has(p)
+      );
+      const merged = [...localOnly, ...cloudUrls, ...existingCloud];
+      try {
+        localStorage.setItem('celebrate70_photos', JSON.stringify(merged));
+      } catch {}
+      return merged;
+    });
   }
 
   function toggleItem(id: string) {
@@ -136,7 +156,7 @@ export default function CelebratePage() {
     }
 
     const tempUrl = URL.createObjectURL(file);
-    setPhotos([tempUrl, ...photos]); // Optimistic load
+    setPhotos(prev => [tempUrl, ...prev]); // Optimistic load
 
     const sb = supabase;
     if (sb && canWrite()) {
@@ -147,19 +167,36 @@ export default function CelebratePage() {
       const { error } = await sb.storage.from('trip-memories').upload(filename, file, {
         contentType: file.type,
       });
+      URL.revokeObjectURL(tempUrl);
       if (error) {
         toast.error("Upload failed: " + error.message);
+        setPhotos(prev => prev.filter(p => p !== tempUrl));
       } else {
         toast.success("Photo shared to the group!");
+        const publicUrl = sb.storage
+          .from('trip-memories')
+          .getPublicUrl(filename).data.publicUrl;
+        // Put the real public URL into state immediately so the photo
+        // survives refresh even if bucket listing is restricted by RLS.
+        setPhotos(prev => {
+          const next = [publicUrl, ...prev.filter(p => p !== tempUrl && p !== publicUrl)];
+          try { localStorage.setItem('celebrate70_photos', JSON.stringify(next)); } catch {}
+          return next;
+        });
         refreshPhotos();
       }
     } else {
-      // Local only fallback
+      // Local only fallback — keep as a data: URL so it persists across
+      // refreshes even when the cloud listing is empty.
       const reader = new FileReader();
       reader.onload = (ev) => {
-        const next = [ev.target?.result as string, ...photos.filter(p => !p.startsWith('blob:'))];
-        setPhotos(next);
-        try { localStorage.setItem('celebrate70_photos', JSON.stringify(next)); } catch {}
+        URL.revokeObjectURL(tempUrl);
+        const dataUrl = ev.target?.result as string;
+        setPhotos(prev => {
+          const next = [dataUrl, ...prev.filter(p => p !== tempUrl && !p.startsWith('blob:'))];
+          try { localStorage.setItem('celebrate70_photos', JSON.stringify(next)); } catch {}
+          return next;
+        });
       };
       reader.readAsDataURL(file);
     }

@@ -1,5 +1,5 @@
 // CELEBRATE 70 — Journey Page: Full 8-day timeline
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { MapPin, ChevronRight, ChevronDown } from "lucide-react";
 import { useItinerary, getCurrentDayIndex, updateItineraryEvent, addItineraryEvent, deleteItineraryEvent, type TripDay } from "@/lib/itinerary";
 import EventCard from "@/components/EventCard";
@@ -65,10 +65,32 @@ export default function JourneyPage() {
   const [openDays, setOpenDays] = useState<Set<string>>(() => {
     const s = new Set<string>();
     if (dayIndex >= 0 && dayIndex < tripDays.length) s.add(tripDays[dayIndex].id);
+    const hash = typeof window !== 'undefined' ? window.location.hash : '';
+    if (hash.startsWith('#event-')) {
+      const eventId = hash.slice('#event-'.length);
+      const day = tripDays.find(d => d.events.some(e => e.id === eventId));
+      if (day) s.add(day.id);
+    }
     return s;
   });
   const [expandedEvent, setExpandedEvent] = useState<string | null>(null);
+  const [highlightedEvent, setHighlightedEvent] = useState<string | null>(null);
   const [isEditMode, setIsEditMode] = useState(false);
+
+  useEffect(() => {
+    const hash = window.location.hash;
+    if (!hash.startsWith('#event-')) return;
+    const eventId = hash.slice('#event-'.length);
+    const raf = window.requestAnimationFrame(() => {
+      const el = document.getElementById(`event-${eventId}`);
+      if (el) {
+        el.scrollIntoView({ behavior: 'smooth', block: 'center' });
+        setHighlightedEvent(eventId);
+        window.setTimeout(() => setHighlightedEvent(null), 1800);
+      }
+    });
+    return () => window.cancelAnimationFrame(raf);
+  }, []);
 
   function toggleDay(id: string) {
     setOpenDays(prev => {
@@ -145,7 +167,14 @@ export default function JourneyPage() {
                   style={{ background: isToday ? 'oklch(0.28 0.07 155 / 0.04)' : 'oklch(0.97 0.02 85 / 0.5)' }}>
                   <div className="space-y-3">
                     {day.events.map((event, eIdx) => (
-                      <div key={event.id}>
+                      <div
+                        key={event.id}
+                        id={`event-${event.id}`}
+                        className="scroll-mt-4 rounded-xl transition-shadow"
+                        style={highlightedEvent === event.id
+                          ? { boxShadow: '0 0 0 3px oklch(0.72 0.14 68 / 0.6)' }
+                          : undefined}
+                      >
                         {isEditMode ? (
                           <div className="bg-white p-3 rounded border shadow-sm flex flex-col gap-2">
                             <input 
